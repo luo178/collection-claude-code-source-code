@@ -11,6 +11,9 @@
     <a href="https://github.com/chauncygu/collection-claude-code-source-code">The newest source of Claude Code</a>
     ·
     <a href="https://github.com/SafeRL-Lab/nano-claude-code/issues">Issue</a>
+  ·
+    <a href="https://deepwiki.com/SafeRL-Lab/nano-claude-code">Brief Intro</a>
+  
   </p>
 </div>
 
