@@ -1486,8 +1486,8 @@ def handle_slash(line: str, state, config) -> Union[bool, tuple]:
     handler = COMMANDS.get(cmd)
     if handler:
         result = handler(args, state, config)
-        # cmd_voice returns ("__voice__", text) to ask the REPL to run_query
-        if isinstance(result, tuple) and result[0] == "__voice__":
+        # cmd_voice/cmd_image return sentinels to ask the REPL to run_query
+        if isinstance(result, tuple) and result[0] in ("__voice__", "__image__"):
             return result
         return True
 
