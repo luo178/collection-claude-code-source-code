@@ -303,14 +303,7 @@ def cmd_model(args: str, _state, config) -> bool:
         return True
 
     pname = detect_provider(m)
-    if pname == "ollama":
-        if "/" in m:
-            prov, mod = m.split("/", 1)
-            if ":" not in mod:
-                m = f"{prov}/{mod}:latest"
-        elif ":" not in m:
-            m = f"{m}:latest"
-            
+
     config["model"] = m
     from config import save_config
     save_config(config)
