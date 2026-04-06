@@ -1884,7 +1884,10 @@ def _tg_send(token: str, chat_id: int, text: str):
     MAX = 4000  # Telegram limit is 4096, leave margin
     chunks = [text[i:i+MAX] for i in range(0, len(text), MAX)]
     for chunk in chunks:
-        _tg_api(token, "sendMessage", {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
+        # Try Markdown first, fallback to plain text if parse fails
+        result = _tg_api(token, "sendMessage", {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
+        if not result or not result.get("ok"):
+            _tg_api(token, "sendMessage", {"chat_id": chat_id, "text": chunk})
 
 def _tg_typing_loop(token: str, chat_id: int, stop_event: threading.Event):
     """Send 'typing...' indicator every 4 seconds until stop_event is set."""
