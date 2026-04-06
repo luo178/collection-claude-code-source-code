@@ -189,10 +189,77 @@ def flush_response() -> None:
     else:
         print()  # ensure newline after plain-text stream
 
+_TOOL_SPINNER_PHRASES = [
+    "☕ Brewing some coffee...",
+    "🚰 Drinking some water...",
+    "🧠 Thinking really hard...",
+    "🔧 Tightening some bolts...",
+    "🎯 Locking on target...",
+    "🔍 Investigating...",
+    "🧩 Connecting the dots...",
+    "⚡ Charging up...",
+    "🎨 Painting the bits...",
+    "🏗️ Building something cool...",
+    "🌀 Spinning the wheels...",
+    "🧪 Running experiments...",
+    "📡 Scanning frequencies...",
+    "🛠️ Tuning the engine...",
+    "🐛 Chasing a bug...",
+]
+
+_tool_spinner_thread = None
+_tool_spinner_stop = threading.Event()
+
+_spinner_phrase = ""
+_spinner_lock = threading.Lock()
+
+def _run_tool_spinner():
+    """Background spinner on a single line using carriage return."""
+    chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    i = 0
+    while not _tool_spinner_stop.is_set():
+        with _spinner_lock:
+            phrase = _spinner_phrase
+        frame = chars[i % len(chars)]
+        sys.stdout.write(f"\r  {frame} {clr(phrase, 'dim')}   ")
+        sys.stdout.flush()
+        i += 1
+        _tool_spinner_stop.wait(0.1)
+
+def _start_tool_spinner():
+    global _tool_spinner_thread
+    if _tool_spinner_thread and _tool_spinner_thread.is_alive():
+        return  # already running
+    import random
+    with _spinner_lock:
+        global _spinner_phrase
+        _spinner_phrase = random.choice(_TOOL_SPINNER_PHRASES)
+    _tool_spinner_stop.clear()
+    _tool_spinner_thread = threading.Thread(target=_run_tool_spinner, daemon=True)
+    _tool_spinner_thread.start()
+
+def _change_spinner_phrase():
+    """Change the spinner phrase without stopping it."""
+    import random
+    with _spinner_lock:
+        global _spinner_phrase
+        _spinner_phrase = random.choice(_TOOL_SPINNER_PHRASES)
+
+def _stop_tool_spinner():
+    global _tool_spinner_thread
+    if not _tool_spinner_thread:
+        return
+    _tool_spinner_stop.set()
+    _tool_spinner_thread.join(timeout=1)
+    _tool_spinner_thread = None
+    # Clear the spinner on the same line
+    sys.stdout.write(f"\r{' ' * 50}\r")
+    sys.stdout.flush()
+
 def print_tool_start(name: str, inputs: dict, verbose: bool):
     """Show tool invocation."""
     desc = _tool_desc(name, inputs)
-    print(clr(f"\n  ⚙  {desc}", "dim", "cyan"), flush=True)
+    print(clr(f"  ⚙  {desc}", "dim", "cyan"), flush=True)
     if verbose:
         print(clr(f"     inputs: {json.dumps(inputs, ensure_ascii=False)[:200]}", "dim"))
 
@@ -280,7 +347,10 @@ def _proactive_watcher_loop(config):
                 cb = config.get("_run_query_callback")
                 if cb:
                     cb(f"(System Automated Event) You have been inactive for {interval} seconds. "
-                       "Check if you have any pending tasks to execute or simply say 'No pending tasks'.")
+                       "Before doing anything else, review your previous messages in this conversation. "
+                       "If you said you would implement, fix, or do something and didn't finish it, "
+                       "continue and complete that work now. "
+                       "Otherwise, check if you have any pending tasks to execute or simply say 'No pending tasks'.")
         except Exception as e:
             traceback.print_exc()
             print(f"\n[proactive watcher error]: {e}", flush=True)
@@ -901,15 +971,19 @@ def cmd_cost(_args: str, state, config) -> bool:
     return True
 
 def cmd_verbose(_args: str, _state, config) -> bool:
+    from config import save_config
     config["verbose"] = not config.get("verbose", False)
     state_str = "ON" if config["verbose"] else "OFF"
     ok(f"Verbose mode: {state_str}")
+    save_config(config)
     return True
 
 def cmd_thinking(_args: str, _state, config) -> bool:
+    from config import save_config
     config["thinking"] = not config.get("thinking", False)
     state_str = "ON" if config["thinking"] else "OFF"
     ok(f"Extended thinking: {state_str}")
+    save_config(config)
     return True
 
 def cmd_permissions(args: str, _state, config) -> bool:
@@ -1927,6 +2001,18 @@ def repl(config: dict, initial_prompt: str = None):
         print(_box_row(clr("│  Permissions: ", "dim") + pmode))
         print(_box_row(clr("│  /model to switch provider · /help for commands", "dim")))
         print(clr("╰" + "─" * (_box_w - 2) + "╯", "dim"))
+
+        # Show active non-default settings
+        active_flags = []
+        if config.get("verbose"):
+            active_flags.append("verbose")
+        if config.get("thinking"):
+            active_flags.append("thinking")
+        if config.get("_proactive_enabled"):
+            active_flags.append("proactive")
+        if active_flags:
+            flags_str = " · ".join(clr(f, "green") for f in active_flags)
+            info(f"Active: {flags_str}")
         print()
 
     query_lock = threading.RLock()
@@ -1962,42 +2048,80 @@ def repl(config: dict, initial_prompt: str = None):
                 print(clr("\n\n[Background Event Triggered]", "yellow"))
 
             print(clr("\n╭─ Claude ", "dim") + clr("●", "green") + clr(" ─────────────────────────", "dim"))
-            if not _RICH:
-                print(clr("│ ", "dim"), end="", flush=True)
 
             thinking_started = False
+            spinner_shown = True
+            _start_tool_spinner()
+            _pre_tool_text = []   # text chunks before a tool call
+            _post_tool = False    # true after a tool has executed
+            _post_tool_buf = []   # text chunks after tool (to check for duplicates)
+            _duplicate_suppressed = False
 
             try:
                 for event in run(user_input, state, config, system_prompt):
+                    # Stop spinner only when visible output arrives
+                    if spinner_shown:
+                        show_thinking = isinstance(event, ThinkingChunk) and verbose
+                        if isinstance(event, TextChunk) or show_thinking or isinstance(event, ToolStart):
+                            _stop_tool_spinner()
+                            spinner_shown = False
+
                     if isinstance(event, TextChunk):
                         if thinking_started:
                             print("\033[0m\n")  # Reset dim ANSI + break line after thinking block
                             thinking_started = False
+
+                        if _post_tool and not _duplicate_suppressed:
+                            # Buffer post-tool text to check for duplicates
+                            _post_tool_buf.append(event.text)
+                            post_so_far = "".join(_post_tool_buf).strip()
+                            pre_text = "".join(_pre_tool_text).strip()
+                            # If post-tool text matches start of pre-tool text, suppress
+                            if pre_text and pre_text.startswith(post_so_far):
+                                if len(post_so_far) >= len(pre_text):
+                                    # Full duplicate confirmed — suppress entirely
+                                    _duplicate_suppressed = True
+                                    _post_tool_buf.clear()
+                                continue
+                            elif post_so_far and not pre_text.startswith(post_so_far):
+                                # Not a duplicate — flush buffered text
+                                for chunk in _post_tool_buf:
+                                    stream_text(chunk)
+                                _post_tool_buf.clear()
+                                _duplicate_suppressed = True  # stop checking
+                                continue
+
                         # stream_text auto-starts Live on first chunk when Rich available
+                        if not _post_tool:
+                            _pre_tool_text.append(event.text)
                         stream_text(event.text)
 
                     elif isinstance(event, ThinkingChunk):
                         if verbose:
                             if not thinking_started:
                                 flush_response()  # stop Live before printing static thinking
-                                print(clr("\n  [thinking]", "dim"))
+                                print(clr("  [thinking]", "dim"))
                                 thinking_started = True
                             stream_thinking(event.text, verbose)
 
                     elif isinstance(event, ToolStart):
-                        flush_response()  # stop Live, commit text so far
+                        flush_response()
                         print_tool_start(event.name, event.inputs, verbose)
+                        _change_spinner_phrase()
 
                     elif isinstance(event, PermissionRequest):
-                        flush_response()  # stop Live before interactive prompt
+                        _stop_tool_spinner()
+                        flush_response()
                         event.granted = ask_permission_interactive(event.description, config)
                         # Live will restart automatically on next TextChunk
 
                     elif isinstance(event, ToolEnd):
                         print_tool_end(event.name, event.result, verbose)
+                        _post_tool = True
+                        _post_tool_buf.clear()
+                        _duplicate_suppressed = False
                         if not _RICH:
                             print(clr("│ ", "dim"), end="", flush=True)
-                        # Live will restart automatically on next TextChunk
 
                     elif isinstance(event, TurnDone):
                         if verbose:
@@ -2007,6 +2131,7 @@ def repl(config: dict, initial_prompt: str = None):
                                 f"+{event.output_tokens} out]", "dim"
                             ))
             except Exception as e:
+                _stop_tool_spinner()
                 import urllib.error
                 # Catch 404 Not Found (Ollama model missing)
                 if isinstance(e, urllib.error.HTTPError) and e.code == 404:
@@ -2023,13 +2148,14 @@ def repl(config: dict, initial_prompt: str = None):
                         return
                 raise e
 
+            _stop_tool_spinner()
             flush_response()  # stop Live, commit any remaining text
             print(clr("╰──────────────────────────────────────────────", "dim"))
             print()
             
             # If this was a background task, we redraw the prompt for the user
             if is_background:
-                print(clr("\n[claude-code-local] ❯ ", "yellow"), end="", flush=True)
+                print(clr("\n[claude-code-local] » ", "yellow"), end="", flush=True)
 
         # Drain any AskUserQuestion prompts raised during this turn
         from tools import drain_pending_questions
@@ -2105,30 +2231,44 @@ def repl(config: dict, initial_prompt: str = None):
             info(f"  (pasted {n} line{'s' if n > 1 else ''})")
             return result
 
-        # ── Phase 3: timing fallback (terminals without bracketed paste) ──────
-        if sys.platform != "win32" and sys.stdin.isatty():
-            # Give the OS up to 60 ms to flush the rest of the paste into the
-            # stdin buffer.  We loop with a short select so we stop as soon as
-            # data stops arriving rather than always waiting the full window.
+        # ── Phase 3: timing fallback ─────────────────────────────────────────
+        if sys.stdin.isatty():
             lines = [first]
-            deadline = 0.06   # total window (seconds)
-            chunk_to = 0.025  # per-chunk timeout
             import time as _time
-            t0 = _time.monotonic()
-            while (_time.monotonic() - t0) < deadline:
-                ready = _sel.select([sys.stdin], [], [], chunk_to)[0]
-                if not ready:
-                    break
-                raw = sys.stdin.readline()
-                if not raw:
-                    break
-                stripped = raw.rstrip("\n")
-                # Stop if we accidentally read the bracketed-paste end marker
-                if _PASTE_END in stripped:
-                    break
-                lines.append(stripped)
-                # Extend window while data keeps coming
+
+            if sys.platform == "win32":
+                # Windows: use msvcrt.kbhit() to detect buffered paste data
+                import msvcrt
+                deadline = 0.12   # wider window for Windows paste latency
+                chunk_to = 0.03
                 t0 = _time.monotonic()
+                while (_time.monotonic() - t0) < deadline:
+                    _time.sleep(chunk_to)
+                    if not msvcrt.kbhit():
+                        break
+                    raw = sys.stdin.readline()
+                    if not raw:
+                        break
+                    stripped = raw.rstrip("\n").rstrip("\r")
+                    lines.append(stripped)
+                    t0 = _time.monotonic()  # extend while data keeps coming
+            else:
+                # Unix: use select() for precise timing
+                deadline = 0.06
+                chunk_to = 0.025
+                t0 = _time.monotonic()
+                while (_time.monotonic() - t0) < deadline:
+                    ready = _sel.select([sys.stdin], [], [], chunk_to)[0]
+                    if not ready:
+                        break
+                    raw = sys.stdin.readline()
+                    if not raw:
+                        break
+                    stripped = raw.rstrip("\n")
+                    if _PASTE_END in stripped:
+                        break
+                    lines.append(stripped)
+                    t0 = _time.monotonic()
 
             if len(lines) > 1:
                 result = "\n".join(lines).strip()
@@ -2142,7 +2282,7 @@ def repl(config: dict, initial_prompt: str = None):
         _print_background_notifications()
         try:
             cwd_short = Path.cwd().name
-            prompt = clr(f"\n[{cwd_short}] ", "dim") + clr("❯ ", "cyan", "bold")
+            prompt = clr(f"\n[{cwd_short}] ", "dim") + clr("» ", "cyan", "bold")
             user_input = _read_input(prompt)
         except (EOFError, KeyboardInterrupt):
             print()
