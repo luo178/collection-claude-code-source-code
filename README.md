@@ -31,8 +31,11 @@ English | [中文](https://github.com/SafeRL-Lab/nano-claude-code/blob/main/docs
 ## 🔥🔥🔥 News (Pacific Time)
 
 
-- 03:43 PM, Apr 05, 2026 (**v3.05.5**): **Reasoning, Rendering, and Packaging Improvements, Enhanced Memory System, Native vision support for local Ollama models**
-  - **Native vision support for local Ollama models** (`llava`, `gemma4`, `llama3.2-vision`): new `/image [prompt]` command captures the current clipboard image, encodes it to Base64, and attaches it to the next prompt. Also adds multi-line paste detection (`_read_input`) so pasted text is submitted as a single turn rather than multiple queries. Install Pillow with `pip install nano-claude-code[vision]`; Linux users also need `xclip` (`sudo apt install xclip`).
+- 03:43 PM, Apr 05, 2026 (**v3.05.5**): **Reasoning, Rendering, and Packaging Improvements, Enhanced Memory System, Native vision support for local Ollama models, Bracketed Paste Mode, Rich Tab Completion**
+  - **Bracketed Paste Mode** — replaced the old timing-based multi-line paste detection with the standard terminal Bracketed Paste Mode protocol (`ESC[?2004h`). Pasted text of any length (code blocks, long prompts, multi-paragraph instructions) is now collected as a single turn with zero latency and no blank-line artifacts. Falls back to a 60 ms timing window for terminals that don't support BPM. Bracketed paste mode is cleanly disabled on REPL exit.
+  - **Rich Tab Completion with descriptions** — pressing Tab after `/` now shows every command with a one-line description and a hint of its subcommands. Typing `/plugin ` then Tab lists all subcommands (`install`, `uninstall`, `enable`, …). Auto-completes to the unique match when only one command matches the prefix. Subcommands supported for `/mcp`, `/plugin`, `/tasks`, `/cloudsave`, `/voice`, `/permissions`, `/proactive`, and `/memory`.
+  - **Model name bug fix** — `--model ollama/qwen3.5:35b` no longer gets corrupted to `ollama/qwen3.5/35b`. The startup colon-to-slash conversion now only fires when the left side of `:` is a known provider name and no `/` is already present, preserving Ollama's `model:tag` format.
+  - **Native vision support for local Ollama models** (`llava`, `gemma4`, `llama3.2-vision`): new `/image [prompt]` command captures the current clipboard image, encodes it to Base64, and attaches it to the next prompt. Install Pillow with `pip install nano-claude-code[vision]`; Linux users also need `xclip` (`sudo apt install xclip`).
   - **Enhanced Memory System** — added `confidence` / `source` / `last_used_at` / `conflict_group` metadata to every memory entry; conflict detection on `MemorySave` warns before overwriting; `MemorySearch` re-ranks results by `confidence × recency` (30-day decay) and updates `last_used_at` on hits; new `/memory consolidate` command runs a lightweight AI analysis of the current session and auto-saves up to 3 long-term insights (user preferences, feedback corrections, project decisions) at 0.8 confidence — never overwrites higher-confidence user memories.
   - **Post-merge fixes** — removed a debug `debug_payload.json` file write that was firing on every OpenAI-compatible API call (left over from PR #11 development). Also fixed ANSI dim color not being reset after the thinking block ends, which caused subsequent text to appear dim in non-Rich terminals. Bumped `pyproject.toml` version to `3.05.4`, and moved `sounddevice` to the optional `voice` extra (`pip install nano-claude-code[voice]`).
   - **Native Ollama reasoning + terminal rendering fix** — local reasoning models (`deepseek-r1`, `qwen3`, `gemma4`) now stream their `<think>` blocks to the terminal. Ollama exposes thoughts in `msg["thinking"]`, but nano-claude was previously dropping them; this is now fixed by yielding `ThinkingChunk` from the Ollama adapter. Also fixed a Windows CMD/PowerShell rendering issue where token-by-token ANSI dim resets caused thoughts to print vertically, and corrected `flush_response()` so it runs once at the end instead of on every thinking token. Enable with `/verbose` and `/thinking`.
@@ -145,6 +148,8 @@ Claude Code is a powerful, production-grade AI coding assistant — but its sour
 - **Rich Live streaming rendering** — When `rich` is installed, responses stream as live-updating Markdown in place (no duplicate raw text), with clean tool-call interleaving.
 - **Native Ollama reasoning** — Local reasoning models (deepseek-r1, qwen3, gemma4) stream their `<think>` tokens directly to the terminal via `ThinkingChunk` events; enable with `/verbose` and `/thinking`.
 - **Native Ollama vision** — `/image [prompt]` captures the clipboard and sends it to local vision models (llava, gemma4, llama3.2-vision) via Ollama's native image API. No cloud required.
+- **Reliable multi-line paste** — Bracketed Paste Mode (`ESC[?2004h`) collects any pasted text — code blocks, multi-paragraph prompts, long diffs — as a single turn with zero latency and no blank-line artifacts.
+- **Rich Tab completion** — Tab after `/` shows all commands with one-line descriptions and subcommand hints; subcommand Tab-complete works for `/mcp`, `/plugin`, `/tasks`, `/cloudsave`, and more.
 
 ### Key design differences
 
@@ -177,7 +182,7 @@ Claude Code is a powerful, production-grade AI coding assistant — but its sour
 | Feature | Details |
 |---|---|
 | Multi-provider | Anthropic · OpenAI · Gemini · Kimi · Qwen · Zhipu · DeepSeek · Ollama · LM Studio · Custom endpoint |
-| Interactive REPL | readline history, Tab-complete slash commands |
+| Interactive REPL | readline history, Tab-complete slash commands with descriptions + subcommand hints; Bracketed Paste Mode for reliable multi-line paste |
 | Agent loop | Streaming API + automatic tool-use loop |
 | 25 built-in tools | Read · Write · Edit · Bash · Glob · Grep · WebFetch · WebSearch · **NotebookEdit** · **GetDiagnostics** · MemorySave · MemoryDelete · MemorySearch · MemoryList · Agent · SendMessage · CheckAgentResult · ListAgentTasks · ListAgentTypes · Skill · SkillList · AskUserQuestion · TaskCreate/Update/Get/List · **SleepTimer** · *(MCP + plugin tools auto-added at startup)* |
 | MCP integration | Connect any MCP server (stdio/SSE/HTTP), tools auto-registered and callable by Claude |
@@ -623,7 +628,7 @@ nano_claude --thinking --verbose
 
 ## Slash Commands (REPL)
 
-Type `/` and press **Tab** to autocomplete.
+Type `/` and press **Tab** to see all commands with descriptions. Continue typing to filter, then Tab again to auto-complete. After a command name, press **Tab** again to see its subcommands (e.g. `/plugin ` → `install`, `uninstall`, `enable`, …).
 
 | Command | Description |
 |---|---|

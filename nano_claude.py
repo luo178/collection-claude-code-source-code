@@ -813,6 +813,9 @@ def cmd_cloudsave(args: str, state, config) -> bool:
 
 
 def cmd_exit(_args: str, _state, _config) -> bool:
+    if sys.stdin.isatty() and sys.platform != "win32":
+        sys.stdout.write("\x1b[?2004l")  # disable bracketed paste mode
+        sys.stdout.flush()
     ok("Goodbye!")
     save_latest("", _state, _config)
     # Auto cloud-sync if enabled
@@ -1534,6 +1537,42 @@ def handle_slash(line: str, state, config) -> Union[bool, tuple]:
 
 # ── Input history setup ────────────────────────────────────────────────────
 
+# Descriptions and subcommands for each slash command (used by Tab completion)
+_CMD_META: dict[str, tuple[str, list[str]]] = {
+    "help":        ("Show help",                          []),
+    "clear":       ("Clear conversation history",         []),
+    "model":       ("Show / set model",                   []),
+    "config":      ("Show / set config key=value",        []),
+    "save":        ("Save session to file",               []),
+    "load":        ("Load a saved session",               []),
+    "history":     ("Show conversation history",          []),
+    "context":     ("Show token-context usage",           []),
+    "cost":        ("Show cost estimate",                 []),
+    "verbose":     ("Toggle verbose output",              []),
+    "thinking":    ("Toggle extended thinking",           []),
+    "permissions": ("Set permission mode",                ["auto", "accept-all", "manual"]),
+    "cwd":         ("Show / change working directory",    []),
+    "skills":      ("List available skills",              []),
+    "memory":      ("Search / list / consolidate memories", ["consolidate"]),
+    "agents":      ("Show background agents",             []),
+    "mcp":         ("Manage MCP servers",                 ["reload", "add", "remove"]),
+    "plugin":      ("Manage plugins",                     ["install", "uninstall", "enable",
+                                                           "disable", "disable-all", "update",
+                                                           "recommend", "info"]),
+    "tasks":       ("Manage tasks",                       ["create", "delete", "get", "clear",
+                                                           "todo", "in-progress", "done", "blocked"]),
+    "task":        ("Manage tasks (alias)",               ["create", "delete", "get", "clear",
+                                                           "todo", "in-progress", "done", "blocked"]),
+    "proactive":   ("Manage proactive background watcher", ["off"]),
+    "cloudsave":   ("Cloud-sync sessions to GitHub Gist", ["setup", "auto", "list", "load", "push"]),
+    "voice":       ("Voice input (record → STT)",         ["lang", "status"]),
+    "image":       ("Send clipboard image to model",      []),
+    "exit":        ("Exit nano-claude-code",              []),
+    "quit":        ("Exit (alias for /exit)",             []),
+    "resume":      ("Resume last session",                []),
+}
+
+
 def setup_readline(history_file: Path):
     if readline is None:
         return
@@ -1544,11 +1583,49 @@ def setup_readline(history_file: Path):
     readline.set_history_length(1000)
     atexit.register(readline.write_history_file, str(history_file))
 
-    # Tab-complete slash commands
-    commands = [f"/{c}" for c in COMMANDS]
+    # Allow "/" to be part of a completion token so "/model" is one word
+    delims = readline.get_completer_delims().replace("/", "")
+    readline.set_completer_delims(delims)
+
     def completer(text: str, state: int):
-        matches = [c for c in commands if c.startswith(text)]
-        return matches[state] if state < len(matches) else None
+        line = readline.get_line_buffer()
+
+        # ── Completing a command name: line has "/" but no space yet ──────────
+        if "/" in line and " " not in line:
+            matches = sorted(f"/{c}" for c in _CMD_META if f"/{c}".startswith(text))
+            return matches[state] if state < len(matches) else None
+
+        # ── Completing a subcommand: "/cmd <partial>" ─────────────────────────
+        if line.startswith("/") and " " in line:
+            cmd = line.split()[0][1:]          # e.g. "mcp"
+            if cmd in _CMD_META:
+                subs = _CMD_META[cmd][1]
+                matches = sorted(s for s in subs if s.startswith(text))
+                return matches[state] if state < len(matches) else None
+
+        return None
+
+    def display_matches(substitution: str, matches: list, longest: int):
+        """Custom display: show command descriptions alongside each match."""
+        sys.stdout.write("\n")
+        line = readline.get_line_buffer()
+        is_cmd = "/" in line and " " not in line
+
+        if is_cmd:
+            col_w = max(len(m) for m in matches) + 2
+            for m in sorted(matches):
+                cmd = m[1:]
+                desc = _CMD_META.get(cmd, ("", []))[0]
+                subs = _CMD_META.get(cmd, ("", []))[1]
+                sub_hint = ("  [" + ", ".join(subs[:4])
+                            + ("…" if len(subs) > 4 else "") + "]") if subs else ""
+                sys.stdout.write(f"  \033[36m{m:<{col_w}}\033[0m  {desc}{sub_hint}\n")
+        else:
+            for m in sorted(matches):
+                sys.stdout.write(f"  {m}\n")
+        sys.stdout.flush()
+
+    readline.set_completion_display_matches_hook(display_matches)
     readline.set_completer(completer)
     readline.parse_and_bind("tab: complete")
 
@@ -1681,44 +1758,95 @@ def repl(config: dict, initial_prompt: str = None):
             print()
         return
 
+    # ── Bracketed paste mode ──────────────────────────────────────────────
+    # Terminals that support bracketed paste wrap pasted content with
+    #   ESC[200~  (start)  …content…  ESC[201~  (end)
+    # This lets us collect the entire paste as one unit regardless of
+    # how many newlines it contains, without any fragile timing tricks.
+    _PASTE_START = "\x1b[200~"
+    _PASTE_END   = "\x1b[201~"
+    _bpm_active  = sys.stdin.isatty() and sys.platform != "win32"
+
+    if _bpm_active:
+        sys.stdout.write("\x1b[?2004h")   # enable bracketed paste mode
+        sys.stdout.flush()
+
     def _read_input(prompt: str) -> str:
-        """Read user input with multi-line paste detection.
-        
-        When text is pasted from clipboard, all lines arrive in stdin nearly
-        simultaneously. After the first input() returns, we check if more data
-        is buffered and absorb it into a single string — preventing the REPL
-        from treating each pasted line as a separate query.
+        """Read one user turn, collecting multi-line pastes as a single string.
+
+        Strategy (in priority order):
+        1. Bracketed paste mode (ESC[200~ … ESC[201~): reliable, zero latency,
+           supported by virtually all modern terminal emulators on Linux/macOS.
+        2. Timing fallback: for terminals without bracketed paste support, read
+           any data buffered in stdin within a short window after the first line.
+        3. Plain input(): for pipes / non-interactive use / Windows.
         """
-        import time as _t
-        first_line = input(prompt)
-        lines = [first_line]
-        
-        if sys.platform == "win32":
-            import msvcrt
-            _t.sleep(0.05)  # let paste buffer fill
-            while msvcrt.kbhit():
-                try:
-                    extra = input()
-                    lines.append(extra)
-                except EOFError:
+        import select as _sel
+
+        # ── Phase 1: get first line via readline (history, line-edit intact) ──
+        first = input(prompt)
+
+        # ── Phase 2: bracketed paste? ─────────────────────────────────────────
+        if _PASTE_START in first:
+            # Strip leading marker; first line may already contain paste end too
+            body = first.replace(_PASTE_START, "")
+            if _PASTE_END in body:
+                # Single-line paste (no embedded newlines)
+                return body.replace(_PASTE_END, "").strip()
+
+            # Multi-line paste: keep reading until end marker arrives
+            lines = [body]
+            while True:
+                ready = _sel.select([sys.stdin], [], [], 2.0)[0]
+                if not ready:
+                    break  # safety timeout — paste stalled
+                raw = sys.stdin.readline()
+                if not raw:
                     break
-                _t.sleep(0.01)
-        else:
-            import select
-            _t.sleep(0.05)
-            while select.select([sys.stdin], [], [], 0.02)[0]:
-                try:
-                    extra = sys.stdin.readline()
-                    if not extra:
-                        break
-                    lines.append(extra.rstrip("\n"))
-                except EOFError:
+                raw = raw.rstrip("\n")
+                if _PASTE_END in raw:
+                    tail = raw.replace(_PASTE_END, "")
+                    if tail:
+                        lines.append(tail)
                     break
-        
-        combined = "\n".join(lines).strip()
-        if len(lines) > 1:
-            info(f"(pasted {len(lines)} lines)")
-        return combined
+                lines.append(raw)
+
+            result = "\n".join(lines).strip()
+            n = result.count("\n") + 1
+            info(f"  (pasted {n} line{'s' if n > 1 else ''})")
+            return result
+
+        # ── Phase 3: timing fallback (terminals without bracketed paste) ──────
+        if sys.platform != "win32" and sys.stdin.isatty():
+            # Give the OS up to 60 ms to flush the rest of the paste into the
+            # stdin buffer.  We loop with a short select so we stop as soon as
+            # data stops arriving rather than always waiting the full window.
+            lines = [first]
+            deadline = 0.06   # total window (seconds)
+            chunk_to = 0.025  # per-chunk timeout
+            import time as _time
+            t0 = _time.monotonic()
+            while (_time.monotonic() - t0) < deadline:
+                ready = _sel.select([sys.stdin], [], [], chunk_to)[0]
+                if not ready:
+                    break
+                raw = sys.stdin.readline()
+                if not raw:
+                    break
+                stripped = raw.rstrip("\n")
+                # Stop if we accidentally read the bracketed-paste end marker
+                if _PASTE_END in stripped:
+                    break
+                lines.append(stripped)
+                # Extend window while data keeps coming
+                t0 = _time.monotonic()
+
+            if len(lines) > 1:
+                result = "\n".join(lines).strip()
+                info(f"  (pasted {len(lines)} lines)")
+                return result
+
+        return first
 
     while True:
         # Show notifications for background agents that finished
@@ -1733,6 +1861,9 @@ def repl(config: dict, initial_prompt: str = None):
                 save_latest("", state, config)
             except Exception as e:
                 warn(f"Auto-save failed on exit: {e}")
+            if _bpm_active:
+                sys.stdout.write("\x1b[?2004l")  # disable bracketed paste mode
+                sys.stdout.flush()
             ok("Goodbye!")
             sys.exit(0)
 
@@ -1816,7 +1947,16 @@ def main():
 
     # Apply CLI overrides first (so key check uses the right provider)
     if args.model:
-        config["model"] = args.model.replace(":", "/", 1)
+        m = args.model
+        # Convert "provider:model" → "provider/model" only when left side is a known provider
+        # (e.g. "ollama:llama3.3" → "ollama/llama3.3"), but leave version tags intact
+        # (e.g. "ollama/qwen3.5:35b" must NOT become "ollama/qwen3.5/35b")
+        if "/" not in m and ":" in m:
+            from providers import PROVIDERS
+            left, _ = m.split(":", 1)
+            if left in PROVIDERS:
+                m = m.replace(":", "/", 1)
+        config["model"] = m
     if args.accept_all:
         config["permission_mode"] = "accept-all"
     if args.verbose:
